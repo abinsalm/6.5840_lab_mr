@@ -33,6 +33,7 @@ const (
 	MapTaskType TaskType = iota
 	ReduceTaskType
 	DoneTaskType
+	WaitTaskType
 )
 
 type TaskStatus int

@@ -2,6 +2,7 @@ package mr
 
 import (
 	"log"
+	"sync"
 	"time"
 )
 import "net"
@@ -14,6 +15,7 @@ type Coordinator struct {
 	InputFiles                 []string
 	NReduce                    int
 	MapTasksQueue              map[string]*MapWorkerTask
+	MapMutex                   *sync.Mutex
 	AvailableMapTasksQueue     []string
 	InProgressMapTasks         map[string]struct{}
 	CompletedMapTasks          map[string]struct{}
@@ -21,6 +23,8 @@ type Coordinator struct {
 	AvailableReduceTasksQueue  []int
 	InProgressReduceTasksQueue map[int]struct{}
 	CompletedReduceTasksCount  int
+	ReduceMutex                *sync.Mutex
+	ReduceTaskCV               *sync.Cond
 	IsDone                     bool
 }
 
@@ -31,12 +35,31 @@ func (c *Coordinator) TaskRequest(taskRequest *TaskRequest, taskResponse *TaskRe
 		return nil
 	}
 
-	if len(c.CompletedMapTasks) == len(c.InputFiles) {
-		serveReduce(taskResponse, c)
-	} else {
+	c.MapMutex.Lock()
+	if len(c.AvailableMapTasksQueue) > 0 {
 		serveMap(taskResponse, c)
+		c.MapMutex.Unlock()
+		return nil
 	}
 
+	for len(c.CompletedMapTasks) < len(c.InputFiles) {
+		c.ReduceTaskCV.Wait()
+	}
+	c.MapMutex.Unlock()
+
+	c.ReduceMutex.Lock()
+	defer c.ReduceMutex.Unlock()
+
+	if c.CompletedReduceTasksCount == c.NReduce {
+		taskResponse.TaskType = DoneTaskType
+		return nil
+	}
+
+	if len(c.AvailableReduceTasksQueue) > 0 {
+		serveReduce(taskResponse, c)
+	} else {
+		taskResponse.TaskType = WaitTaskType
+	}
 	return nil
 }
 
@@ -82,8 +105,11 @@ func (c *Coordinator) MapTaskCompleted(mapTaskCompletedRequest *MapTaskCompleted
 	inputFilePath := mapTaskCompletedRequest.InputFilePath
 	reduceTaskInput := mapTaskCompletedRequest.ReduceTaskInput
 
+	c.MapMutex.Lock()
 	c.CompletedMapTasks[inputFilePath] = struct{}{}
+	c.MapMutex.Unlock()
 
+	c.ReduceMutex.Lock()
 	for reduceTaskId, outputFilePaths := range reduceTaskInput {
 		// initialize struct first time if it doesn't exist
 		if c.ReduceTasks[reduceTaskId] == nil {
@@ -101,17 +127,25 @@ func (c *Coordinator) MapTaskCompleted(mapTaskCompletedRequest *MapTaskCompleted
 		inputFiles := c.ReduceTasks[reduceTaskId].InputFiles
 		log.Printf("Added file path %v to reduce task %v input files\n", inputFiles[len(inputFiles)-1], reduceTaskId)
 	}
+	c.ReduceMutex.Unlock()
+
+	c.MapMutex.Lock()
+	c.ReduceTaskCV.Broadcast()
+	c.MapMutex.Unlock()
 
 	return nil
 }
 
 func (c *Coordinator) ReduceTaskCompleted(reduceTaskCompletedRequest *ReduceTaskCompletedRequest, reduceTaskCompletedResponse *ReduceTaskCompletedResponse) error {
 	reduceTaskId := reduceTaskCompletedRequest.ReduceTaskId
+	c.ReduceMutex.Lock()
+	defer c.ReduceMutex.Unlock()
+
 	c.ReduceTasks[reduceTaskId].TaskStatus = CompletedTask
 	// we need to update this variable to quickly know whether the reduce phase is completed or not
 	c.CompletedReduceTasksCount += 1
 
-	if c.CompletedReduceTasksCount == len(c.ReduceTasks) {
+	if c.CompletedReduceTasksCount == c.NReduce {
 		c.IsDone = true
 	}
 
@@ -135,6 +169,8 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
+	c.ReduceMutex.Lock()
+	defer c.ReduceMutex.Unlock()
 	return c.IsDone
 }
 
@@ -167,6 +203,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.ReduceTasks = make(map[int]*ReduceWorkerTask)
 	c.AvailableReduceTasksQueue = make([]int, 0)
 	c.InProgressReduceTasksQueue = make(map[int]struct{})
+
+	c.MapMutex = &sync.Mutex{}
+	c.ReduceMutex = &sync.Mutex{}
+	c.ReduceTaskCV = sync.NewCond(c.MapMutex)
 
 	c.server()
 	return &c

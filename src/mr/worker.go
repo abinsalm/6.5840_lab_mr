@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 import "log"
 import "net/rpc"
@@ -49,6 +50,12 @@ func Worker(mapf func(string, string) []KeyValue,
 		if taskResponse.TaskType == DoneTaskType {
 			log.Println("Job is done")
 			return
+		}
+
+		if taskResponse.TaskType == WaitTaskType {
+			log.Println("Waiting for tasks")
+			time.Sleep(1 * time.Second)
+			continue
 		}
 
 		if taskResponse.TaskType == MapTaskType {
