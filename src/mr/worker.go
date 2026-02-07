@@ -45,7 +45,10 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	for {
 		taskResponse, err := AskForTask()
-		check(err)
+		if err != nil {
+			log.Println("Coordinator unreachable, exiting")
+			return
+		}
 
 		if taskResponse.TaskType == DoneTaskType {
 			log.Println("Job is done")
@@ -70,11 +73,11 @@ func Worker(mapf func(string, string) []KeyValue,
 
 			log.Println("Sending Coordinator.MapTaskCompleted")
 			ok := call("Coordinator.MapTaskCompleted", &mapTaskCompletedRequest, &mapTaskCompletedResponse)
-			if ok {
-				log.Println("Received successful response for Coordinator.MapTaskCompleted")
-			} else {
-				log.Println("Received error response for Coordinator.MapTaskCompleted!")
+			if !ok {
+				log.Println("Coordinator unreachable, exiting")
+				return
 			}
+			log.Println("Received successful response for Coordinator.MapTaskCompleted")
 		} else if taskResponse.TaskType == ReduceTaskType {
 			log.Println("Starting Reduce task")
 			reduceTaskId := doReduce(reducef, taskResponse)
@@ -86,11 +89,11 @@ func Worker(mapf func(string, string) []KeyValue,
 
 			log.Println("Sending Coordinator.ReduceTaskCompleted")
 			ok := call("Coordinator.ReduceTaskCompleted", &reduceTaskCompletedRequest, &reduceTaskCompletedResponse)
-			if ok {
-				log.Println("Received successful response for Coordinator.ReduceTaskCompleted")
-			} else {
-				log.Println("Received error response for Coordinator.ReduceTaskCompleted!")
+			if !ok {
+				log.Println("Coordinator unreachable, exiting")
+				return
 			}
+			log.Println("Received successful response for Coordinator.ReduceTaskCompleted")
 		}
 	}
 
@@ -283,7 +286,8 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		log.Println("dialing:", err)
+		return false
 	}
 	defer c.Close()
 
