@@ -80,6 +80,7 @@ func serveReduce(taskResponse *TaskResponse, c *Coordinator) {
 
 	reduceTask.TaskStatus = InProgressTask
 	reduceTask.StartTime = time.Now()
+	c.InProgressReduceTasksQueue[reduceTaskId] = struct{}{}
 
 	log.Printf("Task ID %v: Finished serving reduce task\n", reduceTaskId)
 }
@@ -98,6 +99,8 @@ func serveMap(taskResponse *TaskResponse, c *Coordinator) {
 	taskResponse.TaskId = mapTask.TaskId
 	taskResponse.NReduce = c.NReduce
 
+	mapTask.StartTime = time.Now()
+
 	log.Printf("Serving map task %v with file %v\n", mapTask.TaskId, taskResponse.FilePaths[0])
 }
 
@@ -106,6 +109,12 @@ func (c *Coordinator) MapTaskCompleted(mapTaskCompletedRequest *MapTaskCompleted
 	reduceTaskInput := mapTaskCompletedRequest.ReduceTaskInput
 
 	c.MapMutex.Lock()
+	// Ignore late completions from timed-out workers
+	if _, exists := c.CompletedMapTasks[inputFilePath]; exists {
+		c.MapMutex.Unlock()
+		return nil
+	}
+	delete(c.InProgressMapTasks, inputFilePath)
 	c.CompletedMapTasks[inputFilePath] = struct{}{}
 	c.MapMutex.Unlock()
 
@@ -141,6 +150,12 @@ func (c *Coordinator) ReduceTaskCompleted(reduceTaskCompletedRequest *ReduceTask
 	c.ReduceMutex.Lock()
 	defer c.ReduceMutex.Unlock()
 
+	// Ignore late completions from timed-out workers
+	if c.ReduceTasks[reduceTaskId].TaskStatus == CompletedTask {
+		return nil
+	}
+
+	delete(c.InProgressReduceTasksQueue, reduceTaskId)
 	c.ReduceTasks[reduceTaskId].TaskStatus = CompletedTask
 	// we need to update this variable to quickly know whether the reduce phase is completed or not
 	c.CompletedReduceTasksCount += 1
@@ -172,6 +187,37 @@ func (c *Coordinator) Done() bool {
 	c.ReduceMutex.Lock()
 	defer c.ReduceMutex.Unlock()
 	return c.IsDone
+}
+
+func (c *Coordinator) checkTimeouts() {
+	for !c.Done() {
+		time.Sleep(1 * time.Second)
+
+		// check Map tasks
+		c.MapMutex.Lock()
+		for fileName := range c.InProgressMapTasks {
+			task := c.MapTasksQueue[fileName]
+			if time.Since(task.StartTime) > 10*time.Second {
+				delete(c.InProgressMapTasks, fileName)
+				c.AvailableMapTasksQueue = append(c.AvailableMapTasksQueue, fileName)
+				log.Printf("Map task %s timed out, reassigning", fileName)
+			}
+		}
+		c.MapMutex.Unlock()
+
+		// Check reduce tasks (similar logic)
+		c.ReduceMutex.Lock()
+		for taskId := range c.InProgressReduceTasksQueue {
+			task := c.ReduceTasks[taskId]
+			if time.Since(task.StartTime) > 10*time.Second {
+				delete(c.InProgressReduceTasksQueue, taskId)
+				c.AvailableReduceTasksQueue = append(c.AvailableReduceTasksQueue, taskId)
+				task.TaskStatus = NotStarted
+				log.Printf("Reduce task %d timed out, reassigning", taskId)
+			}
+		}
+		c.ReduceMutex.Unlock()
+	}
 }
 
 // create a Coordinator.
@@ -209,5 +255,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.ReduceTaskCV = sync.NewCond(c.MapMutex)
 
 	c.server()
+
+	go c.checkTimeouts()
 	return &c
 }

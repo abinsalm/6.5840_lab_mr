@@ -46,8 +46,9 @@ const (
 )
 
 type MapWorkerTask struct {
-	TaskId   int
-	FileName string
+	TaskId    int
+	FileName  string
+	StartTime time.Time
 }
 
 type ReduceWorkerTask struct {
