@@ -1,14 +1,12 @@
 package mr
 
 import (
-	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
-	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 )
 import "log"
@@ -132,14 +130,12 @@ func doMap(mapf func(string, string) []KeyValue, taskResponse TaskResponse) map[
 
 	// write content to temp file
 	// after all write is finished, move temp file to actual file
-	err := os.MkdirAll("map_files", os.ModePerm)
 	for reduceId, tempFilePath := range mapFiles {
 		outputFileName := fmt.Sprint("mr-", taskResponse.TaskId, "-", reduceId)
-		outputFilePath := filepath.Join("map_files", outputFileName)
-		err = os.Rename(tempFilePath, outputFilePath)
+		err := os.Rename(tempFilePath, outputFileName)
 		check(err)
-		log.Printf("Finished renaming temp file to  %v\n", outputFilePath)
-		reduceTaskInput[reduceId] = append(reduceTaskInput[reduceId], outputFilePath)
+		log.Printf("Finished renaming temp file to  %v\n", outputFileName)
+		reduceTaskInput[reduceId] = append(reduceTaskInput[reduceId], outputFileName)
 	}
 
 	return reduceTaskInput
@@ -163,14 +159,10 @@ func doMapOnKV(kv KeyValue, taskResponse TaskResponse, mapFiles map[int]string) 
 	if err != nil {
 		panic(err)
 	}
-	// close fi on exit and check for its returned error
-	defer func() {
-		if err := outputFile.Close(); err != nil {
-			panic(err)
-		}
-	}()
+	defer outputFile.Close()
 
-	_, err = outputFile.WriteString(fmt.Sprintf("%v %v\n", kv.Key, kv.Value))
+	enc := json.NewEncoder(outputFile)
+	err = enc.Encode(&kv)
 	check(err)
 
 	log.Printf("Finished writing to temp file %v\n", outputFile.Name())
@@ -223,11 +215,9 @@ func doReduce(reducef func(string, []string) string, taskResponse TaskResponse) 
 	}
 
 	// after all write is finished, move temp file to actual file
-	err = os.MkdirAll("reduce_files", os.ModePerm)
-	outputFilePath := filepath.Join("reduce_files", outputFileName)
-	err = os.Rename(tempFile.Name(), outputFilePath)
+	err = os.Rename(tempFile.Name(), outputFileName)
 	check(err)
-	log.Printf("Finished renaming temp file to  %v for reduce task ID %v\n", outputFilePath, reduceTaskID)
+	log.Printf("Finished renaming temp file to  %v for reduce task ID %v\n", outputFileName, reduceTaskID)
 
 	return reduceTaskID
 }
@@ -235,30 +225,19 @@ func doReduce(reducef func(string, []string) string, taskResponse TaskResponse) 
 func reduceFile(inputFilePath string, reduceTaskID int, intermediate []KeyValue) []KeyValue {
 	log.Printf("Reading file content of: %v for reduce task ID: %v\n", inputFilePath, reduceTaskID)
 
-	f, err := os.OpenFile(inputFilePath, os.O_RDONLY, os.ModePerm)
+	f, err := os.Open(inputFilePath)
 	if err != nil {
 		log.Fatalf("open file error: %v", err)
 	}
-	defer func(f *os.File) {
-		err := f.Close()
-		if err != nil {
-		}
-	}(f)
+	defer f.Close()
 
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text() // GET the line string
-		splits := strings.Split(line, " ")
-		if len(splits) == 2 {
-			log.Printf("Splitting content of %v", string(line))
-			key := splits[0]
-			value := splits[1]
-			kv := KeyValue{key, value}
-			intermediate = append(intermediate, kv)
+	dec := json.NewDecoder(f)
+	for {
+		var kv KeyValue
+		if err := dec.Decode(&kv); err != nil {
+			break
 		}
-	}
-	if err := sc.Err(); err != nil {
-		log.Fatalf("scan file error for file %v: %v", inputFilePath, err)
+		intermediate = append(intermediate, kv)
 	}
 
 	log.Printf("Finished Reading file content of: %v for reduce task ID: %v\n", inputFilePath, reduceTaskID)
