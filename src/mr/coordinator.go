@@ -36,13 +36,18 @@ func (c *Coordinator) TaskRequest(taskRequest *TaskRequest, taskResponse *TaskRe
 	}
 
 	c.MapMutex.Lock()
-	if len(c.AvailableMapTasksQueue) > 0 {
-		serveMap(taskResponse, c)
-		c.MapMutex.Unlock()
-		return nil
-	}
-
-	for len(c.CompletedMapTasks) < len(c.InputFiles) {
+	for {
+		// Check for available map tasks first
+		if len(c.AvailableMapTasksQueue) > 0 {
+			serveMap(taskResponse, c)
+			c.MapMutex.Unlock()
+			return nil
+		}
+		// If all maps complete, break to proceed to reduce phase
+		if len(c.CompletedMapTasks) >= len(c.InputFiles) {
+			break
+		}
+		// Wait for either: task completion or timeout reassignment
 		c.ReduceTaskCV.Wait()
 	}
 	c.MapMutex.Unlock()
@@ -50,7 +55,9 @@ func (c *Coordinator) TaskRequest(taskRequest *TaskRequest, taskResponse *TaskRe
 	c.ReduceMutex.Lock()
 	defer c.ReduceMutex.Unlock()
 
-	if c.CompletedReduceTasksCount == c.NReduce {
+	// Check against actual created reduce tasks, not NReduce
+	// Also handle case where no reduce tasks were created (empty map output)
+	if len(c.ReduceTasks) == 0 || c.CompletedReduceTasksCount == len(c.ReduceTasks) {
 		taskResponse.TaskType = DoneTaskType
 		return nil
 	}
@@ -115,9 +122,10 @@ func (c *Coordinator) MapTaskCompleted(mapTaskCompletedRequest *MapTaskCompleted
 		return nil
 	}
 	delete(c.InProgressMapTasks, inputFilePath)
-	c.CompletedMapTasks[inputFilePath] = struct{}{}
+	// Don't mark as complete yet - do it AFTER adding reduce tasks
 	c.MapMutex.Unlock()
 
+	// Add reduce tasks BEFORE marking map as complete
 	c.ReduceMutex.Lock()
 	for reduceTaskId, outputFilePaths := range reduceTaskInput {
 		// initialize struct first time if it doesn't exist
@@ -138,7 +146,9 @@ func (c *Coordinator) MapTaskCompleted(mapTaskCompletedRequest *MapTaskCompleted
 	}
 	c.ReduceMutex.Unlock()
 
+	// NOW mark map as complete - reduce tasks are ready
 	c.MapMutex.Lock()
+	c.CompletedMapTasks[inputFilePath] = struct{}{}
 	c.ReduceTaskCV.Broadcast()
 	c.MapMutex.Unlock()
 
@@ -160,7 +170,9 @@ func (c *Coordinator) ReduceTaskCompleted(reduceTaskCompletedRequest *ReduceTask
 	// we need to update this variable to quickly know whether the reduce phase is completed or not
 	c.CompletedReduceTasksCount += 1
 
-	if c.CompletedReduceTasksCount == c.NReduce {
+	// Check against actual created reduce tasks, not NReduce
+	// (some reduce buckets may have no keys)
+	if c.CompletedReduceTasksCount == len(c.ReduceTasks) {
 		c.IsDone = true
 	}
 
@@ -184,9 +196,19 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
+	c.MapMutex.Lock()
+	allMapsComplete := len(c.CompletedMapTasks) >= len(c.InputFiles)
+	c.MapMutex.Unlock()
+
+	if !allMapsComplete {
+		return false
+	}
+
 	c.ReduceMutex.Lock()
 	defer c.ReduceMutex.Unlock()
-	return c.IsDone
+
+	// All maps complete - job is done if no reduce tasks or all reduce tasks complete
+	return len(c.ReduceTasks) == 0 || c.CompletedReduceTasksCount == len(c.ReduceTasks)
 }
 
 func (c *Coordinator) checkTimeouts() {
@@ -195,13 +217,18 @@ func (c *Coordinator) checkTimeouts() {
 
 		// check Map tasks
 		c.MapMutex.Lock()
+		mapTaskReassigned := false
 		for fileName := range c.InProgressMapTasks {
 			task := c.MapTasksQueue[fileName]
 			if time.Since(task.StartTime) > 10*time.Second {
 				delete(c.InProgressMapTasks, fileName)
 				c.AvailableMapTasksQueue = append(c.AvailableMapTasksQueue, fileName)
 				log.Printf("Map task %s timed out, reassigning", fileName)
+				mapTaskReassigned = true
 			}
+		}
+		if mapTaskReassigned {
+			c.ReduceTaskCV.Broadcast()
 		}
 		c.MapMutex.Unlock()
 
